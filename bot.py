@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 from xml.etree import ElementTree
@@ -20,6 +21,7 @@ from telegram import (
     WebAppInfo,
 )
 from telegram.error import BadRequest
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -32,17 +34,17 @@ from config import load_settings
 from models import Rate
 from remittance_store import RemittanceStore
 from services.managed_rates import (
-    DAB_REFERENCE_SOURCE_ID,
-    REFERENCE_SOURCE_ID,
     ManagedRatesService,
 )
 from services.rates import RatesService
 from utils.formatting import (
     format_comparison,
+    format_local_timestamp,
     format_managed_gold,
     format_managed_rates,
-    format_xe_rates,
+    parse_iso_datetime,
 )
+from utils.conversion import convert_market_amount
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REQUEST_TIMEOUT = 15
@@ -61,7 +63,10 @@ MAIN_MENU_TEXT = (
 )
 REMITS_COMMISSION_RATE = 0.04
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+DAILY_REPORT_CHAT_ID = os.getenv("DAILY_REPORT_CHAT_ID")
 WEB_APP_URL = os.getenv("WEB_APP_URL")
+KABUL_TZ = ZoneInfo("Asia/Kabul")
+CUSTOMER_CURRENCIES = ("AFN", "USD", "EUR", "PKR", "IRR", "AED")
 REMITTANCE_STORE: RemittanceStore | None = None
 MANAGED_RATES: ManagedRatesService | None = None
 REMITTANCE_STATUSES = (
@@ -120,7 +125,12 @@ def build_main_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📊 نرخ اسعار", callback_data="rates"),
+            InlineKeyboardButton("💱 تبدیل هوشمند", callback_data="convert"),
             InlineKeyboardButton("🥇 نرخ طلا", callback_data="gold"),
+        ],
+        [
+            InlineKeyboardButton("🕒 ساعت کابل و بازار", callback_data="market_clock"),
+            InlineKeyboardButton("ℹ️ راهنما", callback_data="guide"),
         ],
         [
             InlineKeyboardButton("🧾 معاملات من", callback_data="transactions"),
@@ -363,32 +373,165 @@ def build_admin_status_keyboard(tracking_code: str, status: str) -> InlineKeyboa
 
 def build_rate_management_keyboard() -> InlineKeyboardMarkup:
     store = get_remittance_store()
-    reference_label = (
-        "خاموش‌کردن نرخ مرجع"
-        if store.is_source_enabled(REFERENCE_SOURCE_ID)
-        else "روشن‌کردن نرخ مرجع"
+    sarai_label = (
+        "⏸ خاموش‌کردن نرخ خودکار سرای شهزاده"
+        if store.is_source_enabled("sarafi_af")
+        else "▶️ روشن‌کردن نرخ خودکار سرای شهزاده"
     )
-    dab_label = (
-        "خاموش‌کردن نرخ Indicative DAB"
-        if store.is_source_enabled(DAB_REFERENCE_SOURCE_ID)
-        else "روشن‌کردن نرخ Indicative DAB"
-    )
+    report_enabled = store.get_setting("daily_report_enabled", "0") == "1"
+    report_label = "⏸ خاموش‌کردن گزارش روزانه" if report_enabled else "▶️ تنظیم گزارش روزانه"
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🩺 وضعیت و سلامت ربات/منبع", callback_data="admin_rates_health")],
+        [InlineKeyboardButton("🔄 بررسی مجدد نرخ سرای شهزاده", callback_data="admin_rates_refresh")],
         [InlineKeyboardButton("📋 مشاهده نرخ ارز و طلا", callback_data="admin_rates_view")],
         [InlineKeyboardButton("➕ افزودن/ویرایش نرخ ارز", callback_data="admin_rates_add_currency")],
+        [InlineKeyboardButton("➕ ثبت اصلاح نرخ خودکار", callback_data="admin_rates_adjust")],
         [InlineKeyboardButton("🥇 افزودن/ویرایش نرخ دستی طلا", callback_data="admin_rates_add_gold")],
         [InlineKeyboardButton("↩️ بازگشت به نرخ خودکار", callback_data="admin_rates_restore")],
-        [
-            InlineKeyboardButton(reference_label, callback_data="admin_rates_toggle_frankfurter"),
-            InlineKeyboardButton(dab_label, callback_data="admin_rates_toggle_frankfurter_dab"),
-        ],
+        [InlineKeyboardButton(sarai_label, callback_data="admin_rates_toggle_sarafi_af")],
+        [InlineKeyboardButton(report_label, callback_data="admin_rates_daily_toggle")],
+        [InlineKeyboardButton("🕘 تعیین ساعت گزارش روزانه", callback_data="admin_rates_daily_time")],
         [InlineKeyboardButton("🧾 تاریخچه تغییرات", callback_data="admin_rates_audit")],
         [InlineKeyboardButton("❌ لغو ورود اطلاعات", callback_data="admin_rates_cancel_input")],
     ])
 
 
+def build_rate_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ تأیید و ذخیره", callback_data="admin_rates_confirm"),
+        InlineKeyboardButton("❌ لغو", callback_data="admin_rates_cancel_input"),
+    ]])
+
+
 def is_admin_user(user_id: int | None) -> bool:
-    return bool(ADMIN_CHAT_ID) and str(user_id) == ADMIN_CHAT_ID
+    allowed_ids = {
+        value.strip()
+        for value in (ADMIN_CHAT_ID or "").replace(";", ",").split(",")
+        if value.strip()
+    }
+    return user_id is not None and str(user_id) in allowed_ids
+
+
+def _currency_unit_scale(currency: str) -> float:
+    return {"PKR": 1000.0, "IRR": 10000.0}.get(currency.upper(), 1.0)
+
+
+def _currency_selection_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(currency, callback_data=f"{prefix}_{currency}")
+            for currency in CUSTOMER_CURRENCIES[index:index + 3]
+        ]
+        for index in range(0, len(CUSTOMER_CURRENCIES), 3)
+    ] + [[InlineKeyboardButton("↩️ بازگشت", callback_data="main")]])
+
+
+def _daily_report_status(store: RemittanceStore) -> str:
+    enabled = store.get_setting("daily_report_enabled", "0") == "1"
+    report_time = store.get_setting("daily_report_time", "09:00")
+    if not DAILY_REPORT_CHAT_ID:
+        return (
+            f"گزارش روزانه: غیرفعال؛ ساعت تنظیم‌شده {report_time} کابل. "
+            "برای فعال‌سازی، DAILY_REPORT_CHAT_ID را در Railway تنظیم کنید."
+        )
+    return (
+        f"گزارش روزانه: {'فعال' if enabled else 'غیرفعال'}، ساعت {report_time} کابل؛ "
+        "شناسه کانال/گروه پیکربندی‌شده: بله."
+    )
+
+
+def _rate_source_status_text(store: RemittanceStore) -> str:
+    source_id = "sarafi_af"
+    health = store.get_source_health(source_id) or {}
+    rates = store.get_automatic_rates(source_id)
+    latest_retrieval = max(
+        (rate.get("retrieved_at") for rate in rates if rate.get("retrieved_at")),
+        default=None,
+    )
+    state = "فعال" if store.is_source_enabled(source_id) else "غیرفعال"
+    last_attempt = format_local_timestamp(
+        parse_iso_datetime(health.get("last_attempt_at"))
+    ) if health.get("last_attempt_at") else "هنوز تلاش نشده"
+    last_success = format_local_timestamp(
+        parse_iso_datetime(latest_retrieval or health.get("last_success_at"))
+    ) if latest_retrieval or health.get("last_success_at") else "هنوز دریافت نشده"
+    return (
+        "🩺 وضعیت نرخ سرای شهزاده\n"
+        f"منبع: https://sarafi.af/fa/exchange-rates\n"
+        f"حالت: {state}\n"
+        f"آخرین دریافت موفق: {last_success} کابل\n"
+        f"آخرین تلاش: {last_attempt} کابل\n"
+        f"آخرین خطا: {health.get('last_error') or 'ندارد'}\n\n"
+        f"{_daily_report_status(store)}"
+    )
+
+
+def _format_conversion_provenance(rates: list[dict]) -> str:
+    lines = []
+    for rate in rates:
+        lines.append(
+            f"• {rate['base_currency']}/{rate['quote_currency']} "
+            f"{rate['rate_type']}: {rate['source']}; "
+            f"زمان دریافت/ثبت: {format_local_timestamp(parse_iso_datetime(rate.get('retrieved_at')))}؛ "
+            f"بروزرسانی منبع: {format_local_timestamp(parse_iso_datetime(rate.get('source_updated_at')))}؛ "
+            f"نوع: {'مدیریت‌شده' if rate.get('is_manual') else 'خودکار'}"
+        )
+    return "\n".join(lines)
+
+
+async def handle_conversion_amount(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    conversion = context.user_data.get("currency_conversion")
+    if not conversion or conversion.get("step") != "amount":
+        return False
+    message = update.effective_message
+    if not message or not message.text:
+        if message:
+            await message.reply_text("لطفاً مبلغ را به شکل عددی وارد کنید.")
+        return True
+    try:
+        amount = float(message.text.strip().replace(",", ""))
+        rates = await get_managed_rates().get_effective_rates()
+        converted, effective_rate, used_rates = convert_market_amount(
+            rates,
+            amount,
+            conversion["source"],
+            conversion["target"],
+        )
+        source_currency = conversion["source"]
+        target_currency = conversion["target"]
+        currency_labels = {
+            "AFN": "افغانی",
+            "USD": "دالر",
+            "EUR": "یورو",
+            "PKR": "روپیه پاکستان",
+            "IRR": "ریال ایران",
+            "AED": "درهم امارات",
+        }
+        source_unit = currency_labels[source_currency]
+        target_unit = currency_labels[target_currency]
+        reply = (
+            "💱 نتیجهٔ تبدیل بازار\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"مبلغ: {amount:g} {source_unit}\n"
+            f"نتیجه: {converted:,.6g} {target_unit}\n"
+            f"نرخ محاسبه: 1 {source_currency} = {effective_rate:.8g} {target_currency}\n"
+            "ورودی و نتیجه در واحد اصلی ارز هستند؛ نرخ منبع برای PKR به‌ازای ۱۰۰۰ روپیه "
+            "و برای IRR به‌ازای ۱۰٬۰۰۰ ریال است.\n"
+            "نوع نرخ: خرید/فروش بازار بر اساس جهت معامله\n"
+            f"━━━━━━━━━━━━━━━━━━\n{_format_conversion_provenance(used_rates)}"
+        )
+        context.user_data.pop("currency_conversion", None)
+        await message.reply_text(reply, reply_markup=build_back_keyboard())
+    except (ValueError, TypeError, KeyError, sqlite3.Error) as error:
+        context.user_data.pop("currency_conversion", None)
+        await message.reply_text(
+            f"⚠️ تبدیل انجام نشد: {error}",
+            reply_markup=build_back_keyboard(),
+        )
+    return True
 
 
 def get_active_customer_remittances(customer_chat_id: int) -> list[dict]:
@@ -513,8 +656,11 @@ async def show_rate_management(
         text = (
             "⚙️ مدیریت نرخ‌ها\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            "Frankfurter نرخ‌های مرجع روزانه دارد؛ نرخ جداگانه خرید/فروش نقدی و حواله DAB از API مستند در دسترس نیست.\n"
-            "قیمت طلا به‌صورت خودکار غیرفعال است، چون واحد قیمت منبع مستند نشده؛ طلا را دستی با واحد و عیار ثبت کنید."
+            "منبع اصلی نرخ بازار: جدول عمومی سرای شهزاده در sarafi.af.\n"
+            "نرخ مرجع روزانهٔ جهانی با نرخ بازار افغانستان مخلوط نمی‌شود.\n"
+            "زمان منبع در صفحه فقط به‌شکل ساعت است؛ زمان دریافت را جداگانه ثبت می‌کنیم.\n"
+            "نرخ خودکار طلا فعال نیست؛ مدیر می‌تواند نرخ محلی یا Spot را با واحد درست ثبت کند.\n\n"
+            + _rate_source_status_text(get_remittance_store())
         )
     keyboard = build_rate_management_keyboard()
     if edit and update.callback_query:
@@ -534,11 +680,38 @@ async def rate_management_callback(
     await query.answer()
 
     action = query.data.removeprefix("admin_rates_")
+    if action == "health":
+        await show_rate_management(
+            update, context, text=_rate_source_status_text(get_remittance_store()), edit=True
+        )
+        return
+    if action == "refresh":
+        try:
+            success = await get_managed_rates().refresh_sarai(force=True)
+        except (sqlite3.Error, requests.RequestException, ValueError, TypeError) as error:
+            logging.warning("Manual Sarafi refresh failed: %s", error)
+            success = False
+        status = (
+            "✅ دریافت تازهٔ سرای شهزاده موفق بود."
+            if success
+            else "⚠️ دریافت موفق نشد؛ نرخ ذخیره‌شده حفظ شده و به‌عنوان نرخ تازه معرفی نمی‌شود."
+        )
+        await show_rate_management(
+            update,
+            context,
+            text=f"{status}\n\n{_rate_source_status_text(get_remittance_store())}",
+            edit=True,
+        )
+        return
     if action == "view":
-        await get_managed_rates().refresh_all()
-        currencies = await get_managed_rates().get_effective_rates()
-        gold = await get_managed_rates().get_effective_gold()
-        text = format_managed_rates(currencies) + "\n\n" + format_managed_gold(gold)
+        try:
+            await get_managed_rates().refresh_all()
+            currencies = await get_managed_rates().get_effective_rates()
+            gold = await get_managed_rates().get_effective_gold()
+            text = format_managed_rates(currencies) + "\n\n" + format_managed_gold(gold)
+        except (sqlite3.Error, requests.RequestException, ValueError, TypeError) as error:
+            logging.warning("Could not load the managed rate list: %s", error)
+            text = "⚠️ فهرست نرخ‌ها فعلاً از ذخیره‌سازی خوانده نشد؛ بعداً دوباره تلاش کنید."
         await show_rate_management(update, context, text=text, edit=True)
         return
     if action == "add_currency":
@@ -547,8 +720,19 @@ async def rate_management_callback(
             "➕ نرخ ارز را در یک خط وارد کنید:\n"
             "BASE QUOTE TYPE VALUE [UNIT]\n"
             "نمونه: USD AFN cash_buy 65.5 AFN per USD\n"
+            "برای PKR مقدار سایت به‌ازای ۱۰۰۰ روپیه و برای IRR به‌ازای ۱۰٬۰۰۰ ریال است.\n"
             "انواع: cash_buy, cash_sell, transfer_buy, transfer_sell, mid_market, spot\n"
-            "جفت‌ارز مطابق همان جهتی ذخیره می‌شود که وارد می‌کنید.",
+            "مقدار ابتدا برای پیش‌نمایش نشان داده می‌شود؛ تا تأیید شما ذخیره نمی‌شود.",
+            reply_markup=build_rate_management_keyboard(),
+        )
+        return
+    if action == "adjust":
+        context.user_data["rate_management_input"] = "adjustment"
+        await query.edit_message_text(
+            "➕ اصلاح مطلق نرخ خودکار را وارد کنید:\n"
+            "BASE AFN cash_buy +/-VALUE\n"
+            "نمونه: USD AFN cash_buy 0.5\n"
+            "اصلاح حداکثر ۲۵٪ نرخ منبع است و پس از پیش‌نمایش تأیید می‌شود.",
             reply_markup=build_rate_management_keyboard(),
         )
         return
@@ -556,11 +740,37 @@ async def rate_management_callback(
         context.user_data["rate_management_input"] = "gold"
         await query.edit_message_text(
             "🥇 قیمت طلا را وارد کنید:\n"
-            "VALUE CURRENCY UNIT [PURITY]\n"
+            "VALUE CURRENCY UNIT [PURITY] [international_spot] [SOURCE=نام_منبع]\n"
             "نمونهٔ طلا‌ی محلی: 8500 AFN gram 21K\n"
-            "نمونهٔ اونس: 4000 USD troy_ounce spot\n"
-            "قیمت دستی به‌عنوان قیمت محلی فقط با همین برچسب نشان داده می‌شود.",
+            "نمونهٔ Spot جهانی دستی: 4000 USD troy_ounce international_spot SOURCE=منبع_اعلامی\n"
+            "قیمت پیش از ثبت برای تأیید نشان داده می‌شود.",
             reply_markup=build_rate_management_keyboard(),
+        )
+        return
+    if action == "daily_time":
+        context.user_data["rate_management_input"] = "daily_time"
+        await query.edit_message_text(
+            "زمان گزارش روزانه را به وقت کابل به شکل HH:MM وارد کنید؛ نمونه: 09:00",
+            reply_markup=build_rate_management_keyboard(),
+        )
+        return
+    if action == "daily_toggle":
+        if not DAILY_REPORT_CHAT_ID:
+            await query.edit_message_text(
+                "برای فعال‌سازی گزارش روزانه، متغیر امن DAILY_REPORT_CHAT_ID را در Railway تنظیم کنید.",
+                reply_markup=build_rate_management_keyboard(),
+            )
+            return
+        store = get_remittance_store()
+        enabled = store.get_setting("daily_report_enabled", "0") != "1"
+        store.set_setting(
+            "daily_report_enabled", "1" if enabled else "0", query.from_user.id
+        )
+        await show_rate_management(
+            update,
+            context,
+            text=f"✅ گزارش روزانه {'فعال' if enabled else 'غیرفعال'} شد.",
+            edit=True,
         )
         return
     if action == "restore":
@@ -574,12 +784,19 @@ async def rate_management_callback(
         return
     if action == "cancel_input":
         context.user_data.pop("rate_management_input", None)
+        context.user_data.pop("pending_rate_change", None)
         await show_rate_management(update, context, edit=True)
+        return
+    if action == "confirm":
+        await confirm_rate_management_input(update, context)
         return
     if action.startswith("toggle_"):
         source_id = action.removeprefix("toggle_")
-        if source_id not in {REFERENCE_SOURCE_ID, DAB_REFERENCE_SOURCE_ID}:
-            await query.answer("منبع خودکار پشتیبانی نمی‌شود.", show_alert=True)
+        if source_id != "sarafi_af":
+            await query.edit_message_text(
+                "این منبع خودکار پشتیبانی نمی‌شود.",
+                reply_markup=build_rate_management_keyboard(),
+            )
             return
         store = get_remittance_store()
         enabled = not store.is_source_enabled(source_id)
@@ -604,7 +821,10 @@ async def rate_management_callback(
             )
         await show_rate_management(update, context, text="\n".join(lines), edit=True)
         return
-    await query.answer("گزینه مدیریت نرخ شناخته نشد.", show_alert=True)
+    await query.edit_message_text(
+        "گزینه مدیریت نرخ شناخته نشد.",
+        reply_markup=build_rate_management_keyboard(),
+    )
 
 
 async def handle_rate_management_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -616,13 +836,32 @@ async def handle_rate_management_input(update: Update, context: ContextTypes.DEF
         await update.effective_message.reply_text("دسترسی مجاز نیست.")
         return True
     if not update.effective_message or not update.effective_message.text:
-        await update.effective_message.reply_text("لطفاً اطلاعات را به شکل متن ارسال کنید.")
+        if update.effective_message:
+            await update.effective_message.reply_text("لطفاً اطلاعات را به شکل متن ارسال کنید.")
         return True
 
-    parts = update.effective_message.text.strip().split()
+    raw_input = update.effective_message.text.strip()
+    parts = raw_input.split()
     try:
         store = get_remittance_store()
         admin_id = update.effective_user.id
+        if operation == "daily_time":
+            try:
+                parsed_time = datetime.strptime(raw_input, "%H:%M").time()
+            except ValueError as error:
+                raise ValueError("زمان باید به شکل HH:MM باشد؛ نمونه: 09:00.") from error
+            store.set_setting(
+                "daily_report_time",
+                parsed_time.strftime("%H:%M"),
+                admin_id,
+            )
+            context.user_data.pop("rate_management_input", None)
+            await show_rate_management(
+                update,
+                context,
+                text=f"✅ ساعت گزارش روزانه به وقت کابل روی {parsed_time:%H:%M} تنظیم شد.",
+            )
+            return True
         if operation == "currency":
             if len(parts) < 4:
                 raise ValueError("فرمت نرخ ارز ناقص است.")
@@ -635,48 +874,139 @@ async def handle_rate_management_input(update: Update, context: ContextTypes.DEF
             }:
                 raise ValueError("نوع نرخ شناخته نشد.")
             value = float(parts[3])
+            if not math.isfinite(value) or value <= 0 or value > 1e12:
+                raise ValueError("نرخ باید عددی مثبت، محدود و معتبر باشد.")
             unit = " ".join(parts[4:]) if len(parts) > 4 else quote
             key = store.fx_rate_key(base, quote, rate_type)
-            action = store.set_manual_rate(
-                rate_key=key,
-                item_kind="currency",
-                base_currency=base,
-                quote_currency=quote,
-                rate_type=rate_type,
-                value=value,
-                unit=unit,
-                purity=None,
-                administrator_id=admin_id,
+            context.user_data["pending_rate_change"] = {
+                "operation": operation,
+                "rate_key": key,
+                "base_currency": base,
+                "quote_currency": quote,
+                "rate_type": rate_type,
+                "value": value,
+                "unit": unit,
+                "base_unit_scale": _currency_unit_scale(base),
+            }
+            context.user_data.pop("rate_management_input", None)
+            await update.effective_message.reply_text(
+                f"پیش‌نمایش نرخ دستی:\n{base}/{quote} — {rate_type}\n"
+                f"مقدار: {value:g} {unit}\n\n"
+                "برای ذخیره نهایی تأیید کنید.",
+                reply_markup=build_rate_confirmation_keyboard(),
             )
-            result = f"✅ نرخ {base}/{quote} ({rate_type}) به‌صورت دستی ثبت شد: {action}."
+            return True
+        elif operation == "adjustment":
+            if len(parts) != 4:
+                raise ValueError("فرمت اصلاح نرخ نادرست است.")
+            base, quote, rate_type = parts[0].upper(), parts[1].upper(), parts[2]
+            if quote != "AFN" or rate_type not in {"cash_buy", "cash_sell"}:
+                raise ValueError("اصلاح فقط برای نرخ خرید یا فروش ارز در برابر AFN مجاز است.")
+            adjustment = float(parts[3])
+            if not math.isfinite(adjustment):
+                raise ValueError("مقدار اصلاح معتبر نیست.")
+            key = store.fx_rate_key(base, quote, rate_type)
+            automatic = next(
+                (
+                    rate for rate in store.get_automatic_rates("sarafi_af")
+                    if rate["rate_key"] == key
+                ),
+                None,
+            )
+            if not automatic:
+                raise ValueError("نرخ خودکار این جفت‌ارز موجود نیست؛ اصلاح انجام نشد.")
+            value = float(automatic["value"]) + adjustment
+            if (
+                value <= 0
+                or value > 1e12
+                or abs(adjustment) > float(automatic["value"]) * 0.25
+            ):
+                raise ValueError("اصلاح باید مثبت‌ماندن نرخ را حفظ کند و حداکثر ۲۵٪ باشد.")
+            context.user_data["pending_rate_change"] = {
+                "operation": operation,
+                "rate_key": key,
+                "base_currency": base,
+                "quote_currency": quote,
+                "rate_type": rate_type,
+                "adjustment": adjustment,
+                "automatic_value": float(automatic["value"]),
+                "value": value,
+                "unit": automatic["unit"],
+            }
+            context.user_data.pop("rate_management_input", None)
+            await update.effective_message.reply_text(
+                f"پیش‌نمایش اصلاح نرخ خودکار:\n{base}/{quote} — {rate_type}\n"
+                f"نرخ منبع: {float(automatic['value']):g} {automatic['unit']}\n"
+                f"اصلاح: {adjustment:+g}\nنرخ نهایی: {value:g} {automatic['unit']}\n\n"
+                "برای ثبت اصلاح تأیید کنید.",
+                reply_markup=build_rate_confirmation_keyboard(),
+            )
+            return True
         elif operation == "gold":
             if len(parts) < 3:
                 raise ValueError("فرمت نرخ طلا ناقص است.")
             value = float(parts[0])
+            if not math.isfinite(value) or value <= 0 or value > 1e12:
+                raise ValueError("قیمت طلا باید عددی مثبت، محدود و معتبر باشد.")
             currency = parts[1].upper()
             unit = parts[2].replace("_", " ")
-            purity = " ".join(parts[3:]) or None
+            gold_kind = "local_market_manual"
+            remaining = parts[3:]
+            source = "مدیریت ربات؛ منبع جداگانه اعلام نشده"
+            if remaining and remaining[-1].lower() == "international_spot":
+                gold_kind = "international_spot_manual"
+                remaining = remaining[:-1]
+            source_tokens = [item for item in remaining if item.startswith("SOURCE=")]
+            if source_tokens:
+                if len(source_tokens) != 1:
+                    raise ValueError("منبع طلا را فقط یک‌بار با SOURCE= وارد کنید.")
+                source = source_tokens[0].removeprefix("SOURCE=").replace("_", " ").strip()
+                remaining.remove(source_tokens[0])
+                if not source or len(source) > 120:
+                    raise ValueError("نام منبع طلا باید بین ۱ تا ۱۲۰ نویسه باشد.")
+            if remaining and remaining[-1].lower() == "international_spot":
+                gold_kind = "international_spot_manual"
+                remaining = remaining[:-1]
+            purity = " ".join(remaining) or None
             if not re.fullmatch(r"[A-Z]{3}", currency):
                 raise ValueError("کد ارز باید سه حرف انگلیسی باشد.")
             key = store.gold_rate_key(unit, currency, purity)
-            action = store.set_manual_rate(
-                rate_key=key,
-                item_kind="gold",
-                base_currency="XAU",
-                quote_currency=currency,
-                rate_type="local_market_manual",
-                value=value,
-                unit=unit,
-                purity=purity,
-                administrator_id=admin_id,
+            if gold_kind.startswith("international"):
+                key += ":international_spot"
+            context.user_data["pending_rate_change"] = {
+                "operation": operation,
+                "rate_key": key,
+                "base_currency": "XAU",
+                "quote_currency": currency,
+                "rate_type": gold_kind,
+                "value": value,
+                "unit": unit,
+                "purity": purity,
+                "source": source,
+            }
+            context.user_data.pop("rate_management_input", None)
+            label = "قیمت Spot جهانی دستی" if gold_kind.startswith("international") else "قیمت بازار محلی دستی"
+            await update.effective_message.reply_text(
+                f"پیش‌نمایش {label}:\n{value:g} {currency} per {unit}"
+                f"{f'، عیار {purity}' if purity else ''}\n\n"
+                "برای ذخیره نهایی تأیید کنید.",
+                reply_markup=build_rate_confirmation_keyboard(),
             )
-            result = f"✅ نرخ دستی طلا ثبت شد ({action})."
+            return True
         elif operation == "restore":
             if len(parts) >= 3 and parts[0].upper() == "GOLD":
                 unit = parts[1].replace("_", " ")
                 currency = parts[2].upper()
-                purity = " ".join(parts[3:]) or None
+                remaining = parts[3:]
+                international = bool(
+                    remaining and remaining[-1].lower() == "international_spot"
+                )
+                if international:
+                    remaining = remaining[:-1]
+                purity = " ".join(remaining) or None
                 key = store.gold_rate_key(unit, currency, purity)
+                if international:
+                    key += ":international_spot"
             elif len(parts) == 3:
                 base, quote, rate_type = parts[0].upper(), parts[1].upper(), parts[2]
                 key = store.fx_rate_key(base, quote, rate_type)
@@ -706,6 +1036,57 @@ async def handle_rate_management_input(update: Update, context: ContextTypes.DEF
     return True
 
 
+async def confirm_rate_management_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    if not is_admin_user(query.from_user.id):
+        await query.answer("دسترسی مجاز نیست.", show_alert=True)
+        return
+    pending = context.user_data.get("pending_rate_change")
+    if not pending:
+        await query.edit_message_text("این پیش‌نمایش دیگر در دسترس نیست.")
+        return
+    try:
+        store = get_remittance_store()
+        if pending["operation"] == "adjustment":
+            store.set_rate_adjustment(
+                pending["rate_key"],
+                pending["adjustment"],
+                query.from_user.id,
+            )
+            message = "✅ اصلاح نرخ خودکار ذخیره شد."
+        else:
+            action = store.set_manual_rate(
+                rate_key=pending["rate_key"],
+                item_kind="gold" if pending["operation"] == "gold" else "currency",
+                base_currency=pending["base_currency"],
+                quote_currency=pending["quote_currency"],
+                rate_type=pending["rate_type"],
+                value=pending["value"],
+                unit=pending["unit"],
+                purity=pending.get("purity"),
+                administrator_id=query.from_user.id,
+                base_unit_scale=pending.get("base_unit_scale", 1.0),
+                source=pending.get("source", "مدیریت ربات"),
+            )
+            message = f"✅ نرخ با موفقیت ذخیره شد ({action})."
+        context.user_data.pop("pending_rate_change", None)
+        await query.edit_message_text(
+            message, reply_markup=build_rate_management_keyboard()
+        )
+    except (ValueError, sqlite3.Error) as error:
+        if isinstance(error, sqlite3.Error):
+            logging.exception("Rate management confirmation failed")
+            message = "⚠️ ذخیره نرخ انجام نشد؛ اطلاعات دیتابیس تغییر نکرد."
+        else:
+            message = f"⚠️ تغییر ذخیره نشد: {error}"
+        await query.edit_message_text(
+            message, reply_markup=build_rate_management_keyboard()
+        )
+
+
 async def show_rates(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -714,7 +1095,7 @@ async def show_rates(
 ):
     try:
         if force_refresh:
-            await get_managed_rates().refresh_reference(force=True)
+            await get_managed_rates().refresh_sarai(force=True)
         rates = await get_managed_rates().get_effective_rates()
         text = format_managed_rates(rates) if rates else RATE_ERROR
     except (requests.RequestException, ValueError, TypeError, KeyError, sqlite3.Error) as error:
@@ -736,10 +1117,20 @@ async def rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_rates(update, context)
 
 
-def _rate_datetime(value: str | None) -> datetime:
+def _rate_datetime(value: str | None) -> datetime | None:
     if value is None:
-        return datetime.now().astimezone()
+        return None
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _rate_observation_datetime(rate: dict) -> datetime:
+    timestamp = (
+        _rate_datetime(rate.get("source_updated_at"))
+        or _rate_datetime(rate.get("retrieved_at"))
+    )
+    if timestamp is None:
+        raise ValueError("Stored rate has no source or retrieval timestamp")
+    return timestamp
 
 
 async def show_comparison(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
@@ -757,9 +1148,7 @@ async def show_comparison(update: Update, context: ContextTypes.DEFAULT_TYPE, ed
                 value=rate["value"],
                 source=rate["source"],
                 rate_type=rate["rate_type"],
-                timestamp=_rate_datetime(
-                    rate.get("source_updated_at") or rate.get("retrieved_at")
-                ),
+                timestamp=_rate_observation_datetime(rate),
                 is_stale=rate.get("is_stale", False),
                 rate_direction="quote_per_base",
                 source_unit=rate["unit"],
@@ -1024,6 +1413,8 @@ async def remittance_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if await handle_rate_management_input(update, context):
         return
+    if await handle_conversion_amount(update, context):
+        return
 
     if context.user_data.get("account_tracking"):
         await handle_account_tracking_message(update, context)
@@ -1268,6 +1659,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data in {"main", "account_main"}:
+        context.user_data.pop("currency_conversion", None)
         await query.edit_message_text(
             MAIN_MENU_TEXT,
             reply_markup=build_main_keyboard(),
@@ -1367,9 +1759,74 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif query.data == "rates":
         await show_rates(update, context, edit=True)
+    elif query.data == "convert":
+        context.user_data["currency_conversion"] = {"step": "source"}
+        await query.edit_message_text(
+            "💱 ارز مبدأ را انتخاب کنید:",
+            reply_markup=_currency_selection_keyboard("convert_from"),
+        )
+    elif query.data.startswith("convert_from_"):
+        source = query.data.removeprefix("convert_from_")
+        if source not in CUSTOMER_CURRENCIES:
+            await query.edit_message_text("ارز مبدأ معتبر نیست.", reply_markup=build_back_keyboard())
+            return
+        context.user_data["currency_conversion"] = {
+            "step": "target",
+            "source": source,
+        }
+        await query.edit_message_text(
+            f"ارز مقصد را انتخاب کنید (مبدأ: {source}):",
+            reply_markup=_currency_selection_keyboard("convert_to"),
+        )
+    elif query.data.startswith("convert_to_"):
+        target = query.data.removeprefix("convert_to_")
+        conversion = context.user_data.get("currency_conversion", {})
+        if target not in CUSTOMER_CURRENCIES or conversion.get("step") != "target":
+            await query.edit_message_text(
+                "درخواست تبدیل منقضی یا نامعتبر است.",
+                reply_markup=build_back_keyboard(),
+            )
+            return
+        if target == conversion["source"]:
+            await query.edit_message_text(
+                "ارز مبدأ و مقصد باید متفاوت باشند؛ ارز مقصد را دوباره انتخاب کنید.",
+                reply_markup=_currency_selection_keyboard("convert_to"),
+            )
+            return
+        conversion["target"] = target
+        conversion["step"] = "amount"
+        context.user_data["currency_conversion"] = conversion
+        await query.edit_message_text(
+            f"مبلغ {conversion['source']} را وارد کنید تا به {target} تبدیل شود.\n"
+            "فقط نرخ تازه و قابل‌اعتبارسنجی برای محاسبه استفاده می‌شود.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ لغو تبدیل", callback_data="convert_cancel")
+            ]]),
+        )
+    elif query.data == "convert_cancel":
+        context.user_data.pop("currency_conversion", None)
+        await query.edit_message_text(
+            "تبدیل لغو شد.", reply_markup=build_back_keyboard()
+        )
+    elif query.data == "market_clock":
+        now = datetime.now(KABUL_TZ)
+        await query.edit_message_text(
+            f"🕒 ساعت کابل: {now:%Y-%m-%d %H:%M}\n"
+            "وضعیت باز/بسته بودن بازار در منبع نرخ مشخص نشده است.",
+            reply_markup=build_back_keyboard(),
+        )
+    elif query.data == "guide":
+        await query.edit_message_text(
+            "ℹ️ راهنما\n"
+            "• نرخ اسعار از جدول سرای شهزاده دریافت می‌شود؛ نرخ تازه‌نباشد با هشدار نشان داده می‌شود.\n"
+            "• تبدیل بر اساس نرخ خرید/فروش و واحد واقعی معامله محاسبه می‌شود.\n"
+            "• نرخ‌های PKR و IRR در جدول منبع به‌ترتیب برای ۱۰۰۰ روپیه و ۱۰٬۰۰۰ ریال هستند.\n"
+            "• نرخ طلا در حال حاضر خودکار نیست و تنها نرخ ثبت‌شدهٔ مدیر نمایش داده می‌شود.",
+            reply_markup=build_back_keyboard(),
+        )
     elif query.data == "refresh":
         try:
-            await get_managed_rates().refresh_reference(force=True)
+            await get_managed_rates().refresh_sarai(force=True)
             await show_rates(update, context, edit=True)
         except (requests.RequestException, ValueError, TypeError, KeyError, sqlite3.Error) as error:
             logging.warning("Currency refresh failed: %s", error)
@@ -1440,11 +1897,42 @@ async def start_rate_refresh_task(application: Application) -> None:
         while True:
             try:
                 await get_managed_rates().refresh_all()
-            except (sqlite3.Error, requests.RequestException, ValueError) as error:
+                await _maybe_send_daily_rate_report(application)
+            except (sqlite3.Error, requests.RequestException, ValueError, TelegramError) as error:
                 logging.warning("Automatic rate refresh failed: %s", error)
             await asyncio.sleep(60)
 
     application.bot_data["rate_refresh_task"] = asyncio.create_task(refresh_loop())
+
+
+async def _maybe_send_daily_rate_report(application: Application) -> None:
+    store = get_remittance_store()
+    if (
+        store.get_setting("daily_report_enabled", "0") != "1"
+        or not DAILY_REPORT_CHAT_ID
+    ):
+        return
+    now = datetime.now(KABUL_TZ)
+    report_time = store.get_setting("daily_report_time", "09:00")
+    try:
+        scheduled = datetime.strptime(report_time, "%H:%M").time()
+    except ValueError:
+        logging.error("Invalid persisted daily report time: %s", report_time)
+        return
+    today = now.date().isoformat()
+    if now.time().replace(tzinfo=None) < scheduled:
+        return
+    if store.get_setting("daily_report_last_sent_date") == today:
+        return
+    rates = await get_managed_rates().get_effective_rates()
+    await application.bot.send_message(
+        chat_id=DAILY_REPORT_CHAT_ID,
+        text=(
+            f"📊 گزارش روزانه اسعار — کابل {now:%Y-%m-%d %H:%M}\n"
+            f"{format_managed_rates(rates)}"
+        ),
+    )
+    store.set_setting("daily_report_last_sent_date", today, 0)
 
 
 async def stop_rate_refresh_task(application: Application) -> None:

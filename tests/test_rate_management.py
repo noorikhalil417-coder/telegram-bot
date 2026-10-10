@@ -15,6 +15,7 @@ from remittance_store import RemittanceStore  # noqa: E402
 from services.managed_rates import (  # noqa: E402
     DAB_REFERENCE_SOURCE_ID,
     REFERENCE_SOURCE_ID,
+    SARAI_SOURCE_ID,
     ManagedRatesService,
 )
 from services.rates import RatesService  # noqa: E402
@@ -193,69 +194,80 @@ class AutomaticRateServiceTests(unittest.IsolatedAsyncioTestCase):
         self.temp_dir.cleanup()
 
     async def test_provider_failure_preserves_cached_value_and_formats_it_stale(self):
-        now = datetime.now(timezone.utc)
-        self.store.upsert_automatic_rates(REFERENCE_SOURCE_ID, [{
-            "rate_key": self.store.fx_rate_key("USD", "AFN", "mid_market"),
+        self.store.upsert_automatic_rates(SARAI_SOURCE_ID, [{
+            "rate_key": self.store.fx_rate_key("USD", "AFN", "cash_buy"),
             "item_kind": "currency",
             "base_currency": "USD",
             "quote_currency": "AFN",
-            "rate_type": "mid_market",
+            "rate_type": "cash_buy",
             "value": 65.0,
             "unit": "AFN per USD",
-            "source": "Reference API",
+            "source": "Sarai Shahzada (sarafi.af)",
             "retrieved_at": "2020-01-01T00:00:00+00:00",
         }])
-        self.rates.refresh_reference_rates = AsyncMock(
+        self.rates.refresh_sarai_rates = AsyncMock(
             return_value=ProviderResult(available=False, message="offline")
         )
 
         values = await self.managed.get_effective_rates()
 
-        self.assertEqual(values[0]["value"], 65.0)
-        self.assertTrue(values[0]["is_stale"])
+        usd_buy = next(rate for rate in values if rate["rate_key"] == self.store.fx_rate_key(
+            "USD", "AFN", "cash_buy"
+        ))
+        self.assertEqual(usd_buy["value"], 65.0)
+        self.assertTrue(usd_buy["is_stale"])
         self.assertIn("دادهٔ ذخیره‌شده و قدیمی", format_managed_rates(values))
 
     async def test_automatic_provider_rate_is_persisted_and_manual_override_survives_refresh(self):
         now = datetime.now(timezone.utc)
         rate = Rate(
-            "USDAFN", "USD", "AFN", 65.123, "Reference API", "mid_market",
+            "USDAFN-cash_buy", "USD", "AFN", 65.123, "Sarai Shahzada (sarafi.af)", "cash_buy",
             now, rate_direction="quote_per_base", retrieved_at=now,
             source_updated_at=now,
         )
-        self.rates.refresh_reference_rates = AsyncMock(
+        self.rates.refresh_sarai_rates = AsyncMock(
             return_value=ProviderResult(rates=(rate,))
         )
-        self.assertTrue(await self.managed.refresh_reference(force=True))
-        key = self.store.fx_rate_key("USD", "AFN", "mid_market")
+        self.assertTrue(await self.managed.refresh_sarai(force=True))
+        key = self.store.fx_rate_key("USD", "AFN", "cash_buy")
         self.store.set_manual_rate(
             rate_key=key,
             item_kind="currency",
             base_currency="USD",
             quote_currency="AFN",
-            rate_type="mid_market",
+            rate_type="cash_buy",
             value=70.0,
             unit="AFN per USD",
             purity=None,
             administrator_id=999,
         )
         rate_new = Rate(
-            "USDAFN", "USD", "AFN", 66.0, "Reference API", "mid_market",
+            "USDAFN-cash_buy", "USD", "AFN", 66.0, "Sarai Shahzada (sarafi.af)", "cash_buy",
             now, rate_direction="quote_per_base", retrieved_at=now,
             source_updated_at=now,
         )
-        self.rates.refresh_reference_rates = AsyncMock(
+        self.rates.refresh_sarai_rates = AsyncMock(
             return_value=ProviderResult(rates=(rate_new,))
         )
-        await self.managed.refresh_reference(force=True)
+        await self.managed.refresh_sarai(force=True)
         effective = await self.managed.get_effective_rates()
-        self.assertEqual(effective[0]["value"], 70.0)
-        self.assertTrue(effective[0]["is_manual"])
+        usd_buy = next(rate for rate in effective if rate["rate_key"] == key)
+        self.assertEqual(usd_buy["value"], 70.0)
+        self.assertTrue(usd_buy["is_manual"])
 
     async def test_disabled_provider_is_not_requested(self):
-        self.store.set_source_enabled(REFERENCE_SOURCE_ID, False, 999)
-        self.rates.refresh_reference_rates = AsyncMock()
-        await self.managed.refresh_reference(force=True)
-        self.rates.refresh_reference_rates.assert_not_awaited()
+        self.store.set_source_enabled(SARAI_SOURCE_ID, False, 999)
+        self.rates.refresh_sarai_rates = AsyncMock()
+        await self.managed.refresh_sarai(force=True)
+        self.rates.refresh_sarai_rates.assert_not_awaited()
+
+    async def test_recent_provider_failure_is_throttled_for_customer_requests(self):
+        self.rates.refresh_sarai_rates = AsyncMock(
+            return_value=ProviderResult(available=False, message="offline")
+        )
+        self.assertFalse(await self.managed.refresh_sarai(force=True))
+        await self.managed.get_effective_rates()
+        self.rates.refresh_sarai_rates.assert_awaited_once()
 
     async def test_gold_remains_manual_only_until_automatic_unit_is_documented(self):
         result = await self.managed.get_effective_gold()
@@ -372,6 +384,14 @@ class RateAdminAccessTests(unittest.IsolatedAsyncioTestCase):
             ),
             context,
         )
+        self.assertEqual(bot.REMITTANCE_STORE.list_effective_rates(), [])
+        confirm = SimpleNamespace(
+            from_user=SimpleNamespace(id=999),
+            edit_message_text=AsyncMock(),
+        )
+        await bot.confirm_rate_management_input(
+            SimpleNamespace(callback_query=confirm), context
+        )
         stored = bot.REMITTANCE_STORE.list_effective_rates()
         self.assertEqual(len(stored), 1)
         self.assertEqual(stored[0]["value"], 65.5)
@@ -390,6 +410,13 @@ class RateAdminAccessTests(unittest.IsolatedAsyncioTestCase):
             ),
             context,
         )
+        confirm_edit = SimpleNamespace(
+            from_user=SimpleNamespace(id=999),
+            edit_message_text=AsyncMock(),
+        )
+        await bot.confirm_rate_management_input(
+            SimpleNamespace(callback_query=confirm_edit), context
+        )
         self.assertEqual(bot.REMITTANCE_STORE.list_effective_rates()[0]["value"], 66.0)
         audit = bot.REMITTANCE_STORE.get_rate_audit_history()
         self.assertEqual(audit[0]["action"], "manual_edit")
@@ -397,7 +424,7 @@ class RateAdminAccessTests(unittest.IsolatedAsyncioTestCase):
     async def test_authorized_admin_can_add_gold_and_restore_manual_override(self):
         context = SimpleNamespace(user_data={"rate_management_input": "gold"})
         gold_message = SimpleNamespace(
-            text="8500 AFN gram 21K",
+            text="8500 AFN gram 21K SOURCE=بازار_معتبر",
             reply_text=AsyncMock(),
         )
         await bot.handle_rate_management_input(
@@ -407,13 +434,21 @@ class RateAdminAccessTests(unittest.IsolatedAsyncioTestCase):
             ),
             context,
         )
+        confirm = SimpleNamespace(
+            from_user=SimpleNamespace(id=999),
+            edit_message_text=AsyncMock(),
+        )
+        await bot.confirm_rate_management_input(
+            SimpleNamespace(callback_query=confirm), context
+        )
         gold = bot.REMITTANCE_STORE.list_effective_rates()[0]
         self.assertEqual(gold["item_kind"], "gold")
         self.assertEqual(gold["unit"], "gram")
         self.assertEqual(gold["purity"], "21K")
+        self.assertEqual(gold["source"], "بازار معتبر")
 
         key = bot.REMITTANCE_STORE.gold_rate_key("gram", "AFN", "21K")
-        bot.REMITTANCE_STORE.upsert_automatic_rates("frankfurter", [{
+        bot.REMITTANCE_STORE.upsert_automatic_rates(SARAI_SOURCE_ID, [{
             "rate_key": key,
             "item_kind": "gold",
             "base_currency": "XAU",
@@ -453,6 +488,95 @@ class RateAdminAccessTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("rate_management_input", context.user_data)
         self.assertIn("دسترسی مجاز نیست", message.reply_text.await_args.args[0])
+
+    async def test_invalid_rates_are_rejected_before_a_preview_is_staged(self):
+        for value in ("0", "-1", "nan", "inf", "-inf", "1e999"):
+            with self.subTest(value=value):
+                context = SimpleNamespace(user_data={"rate_management_input": "currency"})
+                message = SimpleNamespace(
+                    text=f"USD AFN cash_buy {value}",
+                    reply_text=AsyncMock(),
+                )
+                await bot.handle_rate_management_input(
+                    SimpleNamespace(
+                        effective_user=SimpleNamespace(id=999),
+                        effective_message=message,
+                    ),
+                    context,
+                )
+                self.assertNotIn("pending_rate_change", context.user_data)
+                self.assertEqual(bot.REMITTANCE_STORE.list_effective_rates(), [])
+
+    async def test_confirmation_rechecks_admin_authorization(self):
+        context = SimpleNamespace(user_data={
+            "pending_rate_change": {
+                "operation": "currency",
+                "rate_key": "fx:USD:AFN:cash_buy",
+                "base_currency": "USD",
+                "quote_currency": "AFN",
+                "rate_type": "cash_buy",
+                "value": 65.0,
+                "unit": "AFN per USD",
+            }
+        })
+        query = SimpleNamespace(
+            from_user=SimpleNamespace(id=123),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        await bot.confirm_rate_management_input(
+            SimpleNamespace(callback_query=query), context
+        )
+        query.answer.assert_awaited_once_with("دسترسی مجاز نیست.", show_alert=True)
+        self.assertEqual(bot.REMITTANCE_STORE.list_effective_rates(), [])
+
+    async def test_automatic_rate_adjustment_is_previewed_then_audited(self):
+        now = datetime.now(timezone.utc)
+        self.store_rate = bot.REMITTANCE_STORE
+        self.store_rate.upsert_automatic_rates(SARAI_SOURCE_ID, [{
+            "rate_key": self.store_rate.fx_rate_key("USD", "AFN", "cash_buy"),
+            "item_kind": "currency",
+            "base_currency": "USD",
+            "quote_currency": "AFN",
+            "rate_type": "cash_buy",
+            "value": 65.0,
+            "unit": "AFN per USD",
+            "source": "Sarai test fixture",
+            "retrieved_at": now.isoformat(),
+        }])
+        context = SimpleNamespace(user_data={"rate_management_input": "adjustment"})
+        message = SimpleNamespace(
+            text="USD AFN cash_buy 1",
+            reply_text=AsyncMock(),
+        )
+        await bot.handle_rate_management_input(
+            SimpleNamespace(
+                effective_user=SimpleNamespace(id=999),
+                effective_message=message,
+            ),
+            context,
+        )
+        self.assertIsNone(
+            self.store_rate.get_rate(
+                self.store_rate.fx_rate_key("USD", "AFN", "cash_buy")
+            )["adjustment"]
+        )
+        query = SimpleNamespace(
+            from_user=SimpleNamespace(id=999),
+            edit_message_text=AsyncMock(),
+        )
+        await bot.confirm_rate_management_input(
+            SimpleNamespace(callback_query=query), context
+        )
+        rate = self.store_rate.get_rate(
+            self.store_rate.fx_rate_key("USD", "AFN", "cash_buy")
+        )
+        self.assertEqual(rate["value"], 66.0)
+        self.assertTrue(rate["is_adjusted"])
+        self.assertEqual(
+            self.store_rate.get_rate_audit_history()[0]["action"],
+            "adjustment_set",
+        )
 
 
 if __name__ == "__main__":

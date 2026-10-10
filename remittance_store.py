@@ -140,7 +140,8 @@ class RemittanceStore:
                     source_id TEXT NOT NULL,
                     source_updated_at TEXT,
                     retrieved_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    base_unit_scale REAL NOT NULL DEFAULT 1.0
                 )
                 """
             )
@@ -156,6 +157,17 @@ class RemittanceStore:
                     unit TEXT NOT NULL,
                     purity TEXT,
                     source TEXT NOT NULL,
+                    updated_by INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    base_unit_scale REAL NOT NULL DEFAULT 1.0
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rate_adjustments (
+                    rate_key TEXT PRIMARY KEY,
+                    adjustment REAL NOT NULL,
                     updated_by INTEGER NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -184,6 +196,36 @@ class RemittanceStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rate_source_health (
+                    source_id TEXT PRIMARY KEY,
+                    last_attempt_at TEXT,
+                    last_success_at TEXT,
+                    last_error TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value TEXT NOT NULL,
+                    updated_by INTEGER,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            for table in ("automatic_rates", "manual_rates"):
+                columns = {
+                    row["name"]
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                }
+                if "base_unit_scale" not in columns:
+                    connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN "
+                        "base_unit_scale REAL NOT NULL DEFAULT 1.0"
+                    )
             connection.executemany(
                 "INSERT OR IGNORE INTO counters(name, value) VALUES (?, ?)",
                 (("remittance", 1000), ("customer", 10024)),
@@ -196,6 +238,7 @@ class RemittanceStore:
                 (
                     ("frankfurter", 1, self._now()),
                     ("frankfurter_dab", 1, self._now()),
+                    ("sarafi_af", 1, self._now()),
                 ),
             )
         if not self._is_memory:
@@ -472,26 +515,48 @@ class RemittanceStore:
                 SELECT m.rate_key, m.item_kind, m.base_currency, m.quote_currency,
                        m.rate_type, m.value, m.unit, m.purity, m.source,
                        NULL AS source_id, NULL AS source_updated_at,
-                       m.updated_at AS retrieved_at, m.updated_at, 1 AS is_manual
+                       m.updated_at AS retrieved_at, m.updated_at,
+                       m.base_unit_scale, 1 AS is_manual
                 FROM manual_rates AS m
                 ORDER BY rate_key
                 """
             ).fetchall()
-        return [self._rate_dict(row, is_manual=bool(row["is_manual"])) for row in rows]
+            adjustments = {
+                row["rate_key"]: dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM rate_adjustments"
+                ).fetchall()
+            }
+        rates = []
+        for row in rows:
+            rate = self._rate_dict(row, is_manual=bool(row["is_manual"]))
+            adjustment = adjustments.get(rate["rate_key"])
+            if adjustment and not rate["is_manual"]:
+                rate["automatic_value"] = rate["value"]
+                rate["adjustment"] = adjustment["adjustment"]
+                rate["value"] = self._validate_rate(
+                    rate["value"] + adjustment["adjustment"]
+                )
+                rate["is_adjusted"] = True
+                rate["adjustment_updated_by"] = adjustment["updated_by"]
+                rate["adjustment_updated_at"] = adjustment["updated_at"]
+            else:
+                rate["automatic_value"] = rate["value"] if not rate["is_manual"] else None
+                rate["adjustment"] = None
+                rate["is_adjusted"] = False
+            rate["mode"] = (
+                "manual" if rate["is_manual"]
+                else "automatic_adjusted" if rate["is_adjusted"]
+                else "automatic"
+            )
+            rates.append(rate)
+        return rates
 
     def get_rate(self, rate_key: str) -> dict | None:
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT *, 1 AS is_manual FROM manual_rates WHERE rate_key = ?",
-                (rate_key,),
-            ).fetchone()
-            is_manual = row is not None
-            if not row:
-                row = connection.execute(
-                    "SELECT *, 0 AS is_manual FROM automatic_rates WHERE rate_key = ?",
-                    (rate_key,),
-                ).fetchone()
-        return self._rate_dict(row, is_manual=is_manual) if row else None
+        return next(
+            (rate for rate in self.list_effective_rates() if rate["rate_key"] == rate_key),
+            None,
+        )
 
     def get_automatic_rates(self, source_id: str) -> list[dict]:
         with self._connection() as connection:
@@ -520,6 +585,7 @@ class RemittanceStore:
                 rate.get("source_updated_at"),
                 rate["retrieved_at"],
                 now,
+                self._validate_rate(rate.get("base_unit_scale", 1.0)),
             ))
         with self._connection(write=True) as connection:
             connection.executemany(
@@ -527,8 +593,8 @@ class RemittanceStore:
                 INSERT INTO automatic_rates(
                     rate_key, item_kind, base_currency, quote_currency, rate_type,
                     value, unit, purity, source, source_id, source_updated_at,
-                    retrieved_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    retrieved_at, updated_at, base_unit_scale
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(rate_key) DO UPDATE SET
                     item_kind = excluded.item_kind,
                     base_currency = excluded.base_currency,
@@ -541,7 +607,8 @@ class RemittanceStore:
                     source_id = excluded.source_id,
                     source_updated_at = excluded.source_updated_at,
                     retrieved_at = excluded.retrieved_at,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    base_unit_scale = excluded.base_unit_scale
                 """,
                 prepared,
             )
@@ -558,8 +625,14 @@ class RemittanceStore:
         unit: str,
         purity: str | None,
         administrator_id: int,
+        base_unit_scale: float = 1.0,
+        source: str = "مدیریت ربات",
     ) -> str:
         value = self._validate_rate(value)
+        base_unit_scale = self._validate_rate(base_unit_scale)
+        source = source.strip()
+        if not source or len(source) > 120:
+            raise ValueError("Rate source must contain 1 to 120 characters")
         now = self._now()
         rate = {
             "rate_key": rate_key,
@@ -570,9 +643,10 @@ class RemittanceStore:
             "value": value,
             "unit": unit,
             "purity": purity,
-            "source": "مدیریت ربات",
+            "source": source,
             "updated_by": administrator_id,
             "updated_at": now,
+            "base_unit_scale": base_unit_scale,
         }
         with self._connection(write=True) as connection:
             old = connection.execute(
@@ -583,8 +657,9 @@ class RemittanceStore:
                 """
                 INSERT INTO manual_rates(
                     rate_key, item_kind, base_currency, quote_currency,
-                    rate_type, value, unit, purity, source, updated_by, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    rate_type, value, unit, purity, source, updated_by,
+                    updated_at, base_unit_scale
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(rate_key) DO UPDATE SET
                     item_kind = excluded.item_kind,
                     base_currency = excluded.base_currency,
@@ -595,13 +670,34 @@ class RemittanceStore:
                     purity = excluded.purity,
                     source = excluded.source,
                     updated_by = excluded.updated_by,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    base_unit_scale = excluded.base_unit_scale
                 """,
                 (
                     rate_key, item_kind, base_currency, quote_currency, rate_type,
                     value, unit, purity, rate["source"], administrator_id, now,
+                    base_unit_scale,
                 ),
             )
+            old_adjustment = connection.execute(
+                "SELECT * FROM rate_adjustments WHERE rate_key = ?", (rate_key,)
+            ).fetchone()
+            if old_adjustment:
+                connection.execute(
+                    "DELETE FROM rate_adjustments WHERE rate_key = ?", (rate_key,)
+                )
+                connection.execute(
+                    """
+                    INSERT INTO rate_audit_history(
+                        rate_key, action, old_value_json, new_value_json,
+                        administrator_id, changed_at
+                    ) VALUES (?, 'adjustment_removed', ?, NULL, ?, ?)
+                    """,
+                    (
+                        rate_key, json.dumps(dict(old_adjustment), ensure_ascii=False),
+                        administrator_id, now,
+                    ),
+                )
             connection.execute(
                 """
                 INSERT INTO rate_audit_history(
@@ -626,12 +722,16 @@ class RemittanceStore:
             old = connection.execute(
                 "SELECT * FROM manual_rates WHERE rate_key = ?", (rate_key,)
             ).fetchone()
-            if not old:
-                return False
             automatic = connection.execute(
                 "SELECT * FROM automatic_rates WHERE rate_key = ?", (rate_key,)
             ).fetchone()
+            adjustment = connection.execute(
+                "SELECT * FROM rate_adjustments WHERE rate_key = ?", (rate_key,)
+            ).fetchone()
+            if not old and not adjustment:
+                return False
             connection.execute("DELETE FROM manual_rates WHERE rate_key = ?", (rate_key,))
+            connection.execute("DELETE FROM rate_adjustments WHERE rate_key = ?", (rate_key,))
             connection.execute(
                 """
                 INSERT INTO rate_audit_history(
@@ -641,13 +741,174 @@ class RemittanceStore:
                 """,
                 (
                     rate_key,
-                    json.dumps(dict(old), ensure_ascii=False),
-                    json.dumps(dict(automatic), ensure_ascii=False) if automatic else None,
+                    json.dumps(
+                        {
+                            "manual": dict(old) if old else None,
+                            "adjustment": dict(adjustment) if adjustment else None,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "automatic": dict(automatic) if automatic else None,
+                            "adjustment": dict(adjustment) if adjustment else None,
+                        },
+                        ensure_ascii=False,
+                    ),
                     administrator_id,
                     now,
                 ),
             )
             return True
+
+    def set_rate_adjustment(
+        self, rate_key: str, adjustment: float, administrator_id: int
+    ) -> None:
+        if not math.isfinite(float(adjustment)):
+            raise ValueError("Adjustment must be finite")
+        now = self._now()
+        with self._connection(write=True) as connection:
+            automatic = connection.execute(
+                "SELECT * FROM automatic_rates WHERE rate_key = ?", (rate_key,)
+            ).fetchone()
+            manual = connection.execute(
+                "SELECT 1 FROM manual_rates WHERE rate_key = ?", (rate_key,)
+            ).fetchone()
+            if not automatic:
+                raise ValueError("Automatic rate is unavailable for adjustment")
+            if manual:
+                raise ValueError("Restore automatic rate before applying an adjustment")
+            base_value = self._validate_rate(automatic["value"])
+            new_value = self._validate_rate(base_value + float(adjustment))
+            if abs(float(adjustment)) > base_value * 0.25:
+                raise ValueError("Adjustment exceeds the allowed 25 percent")
+            old = connection.execute(
+                "SELECT * FROM rate_adjustments WHERE rate_key = ?", (rate_key,)
+            ).fetchone()
+            new = {
+                "rate_key": rate_key,
+                "adjustment": float(adjustment),
+                "updated_by": administrator_id,
+                "updated_at": now,
+                "automatic_value": base_value,
+                "effective_value": new_value,
+            }
+            connection.execute(
+                """
+                INSERT INTO rate_adjustments(rate_key, adjustment, updated_by, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(rate_key) DO UPDATE SET
+                    adjustment = excluded.adjustment,
+                    updated_by = excluded.updated_by,
+                    updated_at = excluded.updated_at
+                """,
+                (rate_key, float(adjustment), administrator_id, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO rate_audit_history(
+                    rate_key, action, old_value_json, new_value_json,
+                    administrator_id, changed_at
+                ) VALUES (?, 'adjustment_set', ?, ?, ?, ?)
+                """,
+                (
+                    rate_key, json.dumps(dict(old), ensure_ascii=False) if old else None,
+                    json.dumps(new, ensure_ascii=False), administrator_id, now,
+                ),
+            )
+
+    def record_source_health(
+        self,
+        source_id: str,
+        *,
+        success: bool,
+        error: str | None = None,
+    ) -> None:
+        now = self._now()
+        with self._connection(write=True) as connection:
+            old = connection.execute(
+                "SELECT * FROM rate_source_health WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+            last_success_at = old["last_success_at"] if old else None
+            if success:
+                last_success_at = now
+                error = None
+            connection.execute(
+                """
+                INSERT INTO rate_source_health(
+                    source_id, last_attempt_at, last_success_at, last_error
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    last_attempt_at = excluded.last_attempt_at,
+                    last_success_at = excluded.last_success_at,
+                    last_error = excluded.last_error
+                """,
+                (source_id, now, last_success_at, error),
+            )
+
+    def get_source_health(self, source_id: str) -> dict | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM rate_source_health WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_setting(self, setting_key: str, default: str | None = None) -> str | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT setting_value FROM bot_settings WHERE setting_key = ?",
+                (setting_key,),
+            ).fetchone()
+        return row["setting_value"] if row else default
+
+    def set_setting(
+        self,
+        setting_key: str,
+        setting_value: str,
+        administrator_id: int,
+    ) -> None:
+        now = self._now()
+        with self._connection(write=True) as connection:
+            old = connection.execute(
+                "SELECT * FROM bot_settings WHERE setting_key = ?",
+                (setting_key,),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO bot_settings(
+                    setting_key, setting_value, updated_by, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(setting_key) DO UPDATE SET
+                    setting_value = excluded.setting_value,
+                    updated_by = excluded.updated_by,
+                    updated_at = excluded.updated_at
+                """,
+                (setting_key, setting_value, administrator_id, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO rate_audit_history(
+                    rate_key, action, old_value_json, new_value_json,
+                    administrator_id, changed_at
+                ) VALUES (?, 'setting_change', ?, ?, ?, ?)
+                """,
+                (
+                    f"setting:{setting_key}",
+                    json.dumps(dict(old), ensure_ascii=False) if old else None,
+                    json.dumps(
+                        {
+                            "setting_value": setting_value,
+                            "updated_by": administrator_id,
+                            "updated_at": now,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    administrator_id,
+                    now,
+                ),
+            )
 
     def set_source_enabled(self, source_id: str, enabled: bool, administrator_id: int) -> None:
         now = self._now()

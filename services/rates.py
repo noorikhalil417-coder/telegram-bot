@@ -7,6 +7,7 @@ from models import GoldPrice, ProviderResult, Rate
 from services.dab import DABProvider
 from services.frankfurter import FrankfurterProvider
 from services.gold import GoldProvider
+from services.sarai_shahzada import SaraiShahzadaProvider
 from services.xe import XEProvider
 from utils.cache import TTLCache
 
@@ -20,6 +21,7 @@ class RatesService:
         )
         self.gold_provider = GoldProvider(settings.request_timeout)
         self.frankfurter_provider = FrankfurterProvider(settings.request_timeout)
+        self.sarai_shahzada_provider = SaraiShahzadaProvider(settings)
         self.xe_provider = XEProvider(settings.xe_api_key, settings.xe_account_id, settings.request_timeout)
         self.dab_provider = DABProvider()
 
@@ -56,6 +58,12 @@ class RatesService:
 
     async def get_reference_rates(self) -> ProviderResult:
         return await self._get_reference()
+
+    async def get_sarai_rates(self) -> ProviderResult:
+        return await self._get("sarai-af", self.sarai_shahzada_provider.fetch)
+
+    async def refresh_sarai_rates(self) -> ProviderResult:
+        return await self._get("sarai-af", self.sarai_shahzada_provider.fetch, force=True)
 
     async def refresh_reference_rates(self) -> ProviderResult:
         return await self._get_reference(force=True)

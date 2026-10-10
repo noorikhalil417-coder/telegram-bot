@@ -43,6 +43,7 @@ class Rate:
     source_unit: str | None = None
     retrieved_at: datetime | None = None
     source_updated_at: datetime | None = None
+    base_unit_scale: float = 1.0
 
 
 @dataclass(frozen=True)

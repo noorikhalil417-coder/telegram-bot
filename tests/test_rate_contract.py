@@ -3,6 +3,9 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
+import requests
+from unittest.mock import Mock, patch
+
 from config import Settings
 from models import GoldPrice, ProviderResult, Rate
 from services.exchange_rate_api import ExchangeRateAPIProvider
@@ -10,12 +13,7 @@ from services.gold import GoldProvider
 from services.rates import RatesService
 from services.sarai_shahzada import SaraiShahzadaProvider
 from services.xe import XEProvider
-from utils.formatting import (
-    format_comparison,
-    format_gold,
-    format_reference_rates,
-    format_xe_rates,
-)
+from utils.formatting import format_comparison, format_gold, format_managed_rates, format_xe_rates
 
 
 class RateProviderContractTests(unittest.TestCase):
@@ -28,27 +26,50 @@ class RateProviderContractTests(unittest.TestCase):
         )
         self.sarai_html = """<table>
         <tr><th>واحد پول</th><th>خرید</th><th>فروش</th></tr>
-        <tr><td>USD - دالر آمریکا</td><td>0.256</td><td>65.05</td></tr>
-        <tr><td>EUR - یورو اروپا</td><td>74.00</td><td>74.20</td></tr>
-        <tr><td>IRR - تومان ایران هزار</td><td>0.25</td><td>0.26</td></tr>
+        <tr><td><a href="/fa/exchange-rates/sarai-shahzada/USD-AFN">USD - دالر آمریکا</a></td><td>65.05</td><td>65.10</td></tr>
+        <tr><td><a href="/fa/exchange-rates/sarai-shahzada/EUR-AFN">EUR - یورو اروپا</a></td><td>70.00</td><td>70.20</td></tr>
+        <tr><td><a href="/fa/exchange-rates/sarai-shahzada/IRR-AFN">IRR - تومان ایران هزار</a></td><td>0.25</td><td>0.26</td></tr>
+        <tr><td><a href="/fa/exchange-rates/sarai-shahzada/PKR-AFN">PKR - روپیه پاکستان هزار</a></td><td>0.23</td><td>0.24</td></tr>
+        <tr><td><a href="/fa/exchange-rates/sarai-shahzada/AED-AFN">AED - درهم</a></td><td>17.00</td><td>17.10</td></tr>
         </table>"""
 
-    def test_sarai_keeps_raw_values_and_unknown_direction(self):
+    def test_sarai_maps_real_pairs_and_declares_units_and_direction(self):
         rates = SaraiShahzadaProvider(self.settings)._parse(
             self.sarai_html,
             retrieved_at=self.retrieved_at,
         )
-        indexed = {(rate.quote_currency, rate.rate_type): rate for rate in rates}
+        indexed = {(rate.base_currency, rate.rate_type): rate for rate in rates}
 
-        self.assertEqual(indexed[("USD", "cash_buy")].value, 0.256)
-        self.assertEqual(indexed[("EUR", "cash_buy")].value, 74.0)
-        self.assertEqual(indexed[("EUR", "cash_sell")].value, 74.2)
+        self.assertEqual(indexed[("USD", "cash_buy")].value, 65.05)
+        self.assertEqual(indexed[("EUR", "cash_buy")].value, 70.0)
+        self.assertEqual(indexed[("EUR", "cash_sell")].value, 70.2)
         toman = indexed[("IRR", "cash_buy")]
         self.assertEqual(toman.value, 0.25)
-        self.assertEqual(toman.source_unit, "IRR - تومان ایران هزار")
-        self.assertEqual(toman.rate_direction, "source_unspecified")
+        self.assertEqual(toman.source_unit, "AFN per 10,000 IRR")
+        self.assertEqual(toman.base_unit_scale, 10000.0)
+        self.assertEqual(toman.rate_direction, "quote_per_base")
+        self.assertEqual(indexed[("PKR", "cash_buy")].base_unit_scale, 1000.0)
         self.assertIsNone(toman.source_updated_at)
         self.assertEqual(toman.retrieved_at, self.retrieved_at)
+
+    def test_sarai_rejects_incomplete_response_and_timeout_without_fake_rates(self):
+        provider = SaraiShahzadaProvider(self.settings)
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            provider._parse(
+                '<table><tr><th>واحد پول</th><th>خرید</th><th>فروش</th></tr>'
+                '<tr><td><a href="/exchange-rates/sarai-shahzada/USD-AFN">'
+                'USD - دالر</a></td><td>65</td><td>66</td></tr></table>'
+            )
+        with patch(
+            "services.sarai_shahzada.requests.get",
+            side_effect=requests.Timeout("timed out"),
+        ) as get:
+            with patch("services.sarai_shahzada.sleep"):
+                result = provider.fetch()
+        self.assertFalse(result.available)
+        self.assertEqual(result.rates, ())
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args.kwargs["timeout"], self.settings.request_timeout)
 
     def test_exchange_rate_api_declares_quote_per_base_and_both_times(self):
         payload = {
@@ -83,18 +104,35 @@ class RateProviderContractTests(unittest.TestCase):
             self.sarai_html,
             retrieved_at=self.retrieved_at,
         )
-        message = format_reference_rates(tuple(rates))
-        self.assertIn("خرید (طبق منبع): 0.256", message)
-        self.assertIn("فروش (طبق منبع): 65.05", message)
-        self.assertIn("تومان ایران (واحد منبع: هزار تومان)", message)
-        self.assertIn("خرید (طبق منبع): 0.25", message)
-        self.assertNotIn("AFN", message)
-        self.assertIn("جهت ریاضی نرخ در منبع مشخص نشده", message)
+        managed = [
+            {
+                "rate_key": rate.symbol,
+                "item_kind": "currency",
+                "base_currency": rate.base_currency,
+                "quote_currency": rate.quote_currency,
+                "rate_type": rate.rate_type,
+                "value": rate.value,
+                "unit": rate.source_unit,
+                "source": rate.source,
+                "retrieved_at": rate.retrieved_at.isoformat(),
+                "source_updated_at": None,
+                "is_manual": False,
+                "is_stale": False,
+            }
+            for rate in rates
+        ]
+        message = format_managed_rates(managed)
+        self.assertIn("65.05 AFN", message)
+        self.assertIn("70.2 AFN", message)
+        self.assertIn("AFN per 10,000 IRR", message)
+        self.assertIn("AFN per 1,000 PKR", message)
         self.assertIn("بروزرسانی منبع: اعلام نشده", message)
-        self.assertIn("📌 منبع: Sarai Shahzada (sarafi.af)", message)
 
-        stale_rates = tuple(replace(rate, is_stale=True) for rate in rates)
-        self.assertIn("cache قدیمی است و تازه نیست", format_reference_rates(stale_rates))
+        stale_managed = [
+            dict(rate, is_stale=True)
+            for rate in managed
+        ]
+        self.assertIn("دادهٔ ذخیره‌شده و قدیمی", format_managed_rates(stale_managed))
 
     def test_comparison_uses_provider_source_name(self):
         rate = Rate(

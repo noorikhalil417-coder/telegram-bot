@@ -8,7 +8,7 @@ def status_label(is_stale: bool) -> str:
     return "⚠️ آخرین داده معتبر" if is_stale else "🕐 آخرین بروزرسانی"
 
 
-def _format_local_timestamp(value) -> str:
+def format_local_timestamp(value) -> str:
     if value is None:
         return "اعلام نشده"
     if value.tzinfo is None:
@@ -55,8 +55,8 @@ def format_xe_rates(rates: tuple[Rate, ...]) -> str:
     source_updates = [rate.source_updated_at for rate in rates if rate.source_updated_at]
     lines.extend([
         "━━━━━━━━━━━━━",
-        f"🕐 زمان دریافت: {_format_local_timestamp(retrieved_at)}",
-        f"🕐 بروزرسانی منبع: {_format_local_timestamp(max(source_updates, default=None))}",
+        f"🕐 زمان دریافت: {format_local_timestamp(retrieved_at)}",
+        f"🕐 بروزرسانی منبع: {format_local_timestamp(max(source_updates, default=None))}",
         "📌 منبع: XE (mid-market)",
         "⚠️ این نرخ خرید یا فروش صرافی افغانستان نیست.",
     ])
@@ -116,8 +116,8 @@ def format_reference_rates(rates: tuple[Rate, ...]) -> str:
     ) else ""
     lines.extend([
         "━━━━━━━━━━━━━━━━━━",
-        f"{stale_note}{direction_note}🕐 زمان دریافت: {_format_local_timestamp(received_at)}",
-        f"🕐 بروزرسانی منبع: {_format_local_timestamp(source_updated_at)}",
+        f"{stale_note}{direction_note}🕐 زمان دریافت: {format_local_timestamp(received_at)}",
+        f"🕐 بروزرسانی منبع: {format_local_timestamp(source_updated_at)}",
         f"📌 منبع: {source}",
     ])
     return "\n".join(lines)
@@ -134,27 +134,48 @@ def format_managed_rates(rates: list[dict]) -> str:
         "mid_market": "نرخ مرجع روزانه",
         "indicative": "نرخ Indicative منبع DAB",
         "spot": "نرخ لحظه‌ای ارائه‌دهنده",
+        "local_market_manual": "قیمت دستی بازار محلی",
+        "international_spot_manual": "قیمت دستی Spot جهانی",
     }
     lines = ["📊 نرخ اسعار", "━━━━━━━━━━━━━━━━━━"]
     for rate in rates:
         stale = " ⚠️ دادهٔ ذخیره‌شده و قدیمی" if rate.get("is_stale") else ""
-        managed = "دستی (مدیریت)" if rate["is_manual"] else "خودکار / مرجع"
+        managed = (
+            "دستی (مدیریت)"
+            if rate["is_manual"]
+            else "خودکار با اصلاح ثبت‌شده"
+            if rate.get("is_adjusted")
+            else "خودکار"
+        )
         if rate["rate_type"] == "source_unspecified":
             quote = f"مقدار خام منبع: {_display_rate_value(rate['value'])} ({rate['unit']})"
         else:
+            base_quantity = _display_rate_value(
+                float(rate.get("base_unit_scale", 1.0))
+            )
             quote = (
-                f"1 {rate['base_currency']} = "
+                f"{base_quantity} {rate['base_currency']} = "
                 f"{_display_rate_value(rate['value'])} {rate['quote_currency']} "
                 f"({rate['unit']})"
+            )
+        adjustment_note = ""
+        if rate.get("is_adjusted"):
+            adjustment_note = (
+                f"\nنرخ خودکار: {_display_rate_value(rate['automatic_value'])}؛ "
+                f"اصلاح مدیر: {rate['adjustment']:+g}"
             )
         lines.extend([
             f"\n{rate['base_currency']} → {rate['quote_currency']} "
             f"({type_labels.get(rate['rate_type'], rate['rate_type'])})",
             quote,
+        ])
+        if adjustment_note:
+            lines.append(adjustment_note)
+        lines.extend([
             f"نوع: {managed}{stale}",
             f"منبع: {rate['source']}",
-            f"آخرین بروزرسانی منبع: {_format_local_timestamp(_parse_iso_datetime(rate.get('source_updated_at')))}",
-            f"زمان دریافت/ثبت: {_format_local_timestamp(_parse_iso_datetime(rate.get('retrieved_at')))}",
+            f"آخرین بروزرسانی منبع: {format_local_timestamp(parse_iso_datetime(rate.get('source_updated_at')))}",
+            f"زمان دریافت/ثبت: {format_local_timestamp(parse_iso_datetime(rate.get('retrieved_at')))}",
         ])
     lines.extend([
         "",
@@ -171,9 +192,9 @@ def format_managed_gold(rates: list[dict]) -> str:
     lines = ["🥇 قیمت طلا", "━━━━━━━━━━━━━"]
     for rate in rates:
         label = (
-            "نرخ مرجع Spot جهانی"
-            if rate["rate_type"] == "international_spot"
-            else "نرخ دستی مدیریت"
+            "قیمت Spot جهانی، ثبت‌شده توسط مدیر"
+            if rate["rate_type"] == "international_spot_manual"
+            else "قیمت بازار محلی، ثبت‌شده توسط مدیر"
         )
         stale = " ⚠️ دادهٔ ذخیره‌شده و قدیمی" if rate.get("is_stale") else ""
         purity = f"، عیار/خلوص: {rate['purity']}" if rate.get("purity") else ""
@@ -182,17 +203,17 @@ def format_managed_gold(rates: list[dict]) -> str:
             f"{rate['quote_currency']}",
             f"نوع: {label}{stale}{purity}",
             f"منبع: {rate['source']}",
-            f"زمان قیمت منبع: {_format_local_timestamp(_parse_iso_datetime(rate.get('source_updated_at')))}",
-            f"زمان دریافت/ثبت: {_format_local_timestamp(_parse_iso_datetime(rate.get('retrieved_at')))}",
+            f"زمان قیمت منبع: {format_local_timestamp(parse_iso_datetime(rate.get('source_updated_at')))}",
+            f"زمان دریافت/ثبت: {format_local_timestamp(parse_iso_datetime(rate.get('retrieved_at')))}",
         ])
     lines.extend([
         "",
-        "⚠️ قیمت Spot جهانی، قیمت بازار محلی افغانستان، اجرت ساخت یا قیمت طلا به عیار مشخص نیست.",
+        "⚠️ قیمت جهانی و محلی جدا هستند؛ نرخ خودکار طلا فعال نیست و همه قیمت‌های این فهرست را مدیر ثبت کرده است.",
     ])
     return "\n".join(lines)
 
 
-def _parse_iso_datetime(value: str | None):
+def parse_iso_datetime(value: str | None):
     if not value:
         return None
     try:
