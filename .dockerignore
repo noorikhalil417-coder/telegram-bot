@@ -1,4 +1,5 @@
 .git/
+.github/
 .env
 .env.*
 **/.env
@@ -17,6 +18,9 @@ __pycache__/
 .ruff_cache/
 .vscode/
 tests/
+README.md
+fly.toml
+*.zip
 
 *.sqlite
 *.sqlite3
