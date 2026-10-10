@@ -1,0 +1,106 @@
+:root {
+  color-scheme: dark;
+  --ink: #f4f0e6;
+  --muted: rgba(230, 222, 202, 0.76);
+  --gold: #c4a66b;
+  --glass: rgba(20, 44, 33, 0.58);
+  --glass-strong: rgba(34, 65, 49, 0.76);
+  --border: rgba(196, 166, 107, 0.38);
+  --shadow: rgba(0, 0, 0, 0.34);
+  font-family: "Vazirmatn", "Noto Sans Arabic", Tahoma, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html { min-height: 100%; background: #101713; }
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  color: var(--ink);
+  background:
+    repeating-linear-gradient(128deg, transparent 0, transparent 42px, rgba(196, 166, 107, 0.018) 43px, transparent 44px),
+    linear-gradient(145deg, #0b100d 0%, #12251b 55%, #17251c 100%);
+}
+
+button { font: inherit; }
+
+.app-shell {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 620px);
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: max(28px, env(safe-area-inset-top)) 18px max(22px, env(safe-area-inset-bottom));
+}
+
+.brand-header {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 13px;
+  align-items: center;
+  margin: 8px 2px 28px;
+}
+
+.brand-mark {
+  display: grid;
+  width: 52px;
+  height: 52px;
+  place-items: center;
+  border: 1px solid rgba(196, 166, 107, 0.58);
+  border-radius: 18px;
+  background: linear-gradient(145deg, rgba(196, 166, 107, 0.2), rgba(34, 65, 49, 0.78));
+  box-shadow: 0 10px 26px var(--shadow), inset 0 1px rgba(255, 245, 220, 0.22);
+  font-size: 25px;
+  font-weight: 900;
+  color: var(--gold);
+}
+
+.eyebrow { margin: 0 0 4px; color: var(--muted); font-size: 10px; }
+h1 { margin: 0; font-size: 22px; line-height: 1.35; }
+.welcome { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+.status-dot { width: 10px; height: 10px; border-radius: 50%; background: #77a785; box-shadow: 0 0 0 5px rgba(119, 167, 133, 0.14), 0 0 14px rgba(119, 167, 133, 0.45); }
+
+.menu-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.glass-button {
+  display: flex;
+  min-height: 104px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px 15px;
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  color: var(--ink);
+  text-align: right;
+  background: linear-gradient(145deg, var(--glass-strong), var(--glass));
+  box-shadow: 0 13px 25px var(--shadow), inset 0 1px rgba(255, 245, 220, 0.13);
+  backdrop-filter: blur(18px) saturate(125%);
+  -webkit-backdrop-filter: blur(18px) saturate(125%);
+  cursor: pointer;
+  transition: transform 160ms ease, background 160ms ease, box-shadow 160ms ease;
+}
+
+.glass-button span { font-size: 28px; line-height: 1; filter: drop-shadow(0 3px 5px rgba(0, 0, 0, 0.34)); }
+.glass-button strong { font-size: 14px; font-weight: 700; line-height: 1.45; }
+.glass-button:active { transform: scale(0.97); background: rgba(196, 166, 107, 0.16); box-shadow: 0 7px 14px var(--shadow), inset 0 1px rgba(255, 245, 220, 0.22); }
+.glass-button:focus-visible { outline: 2px solid var(--gold); outline-offset: 3px; }
+@media (hover: hover) { .glass-button:hover { transform: translateY(-3px); background: rgba(196, 166, 107, 0.14); } }
+
+.secure-note { margin: 24px 0 0; color: var(--muted); font-size: 12px; text-align: center; }
+.toast { min-height: 20px; margin: 9px 0 0; color: var(--muted); font-size: 12px; text-align: center; }
+
+@media (max-width: 390px) {
+  .app-shell { padding-right: 13px; padding-left: 13px; }
+  h1 { font-size: 19px; }
+  .menu-grid { gap: 9px; }
+  .glass-button { min-height: 96px; padding: 13px; border-radius: 18px; }
+  .glass-button strong { font-size: 12px; }
+}
